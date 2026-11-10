@@ -1,0 +1,10 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "SIMDVault",
+      "constructorArgs": []
+    }
+  ],
+  "notes": "TEST ONLY. SIMD TEST 3 vault set. Not the real SIMD. Do not buy. The test token has no value. SIMDVault has no constructor arguments and deploys and permanently links StakeRewards, JobsVault and SimdAirdrop in its constructor, including the one-time StakeRewards.setJobsVault call. Their addresses are exposed by stakeRewards(), jobsVault() and airdrop(). All four use the fixed Robinhood Chain (4663) addresses and NOTICE in the accepted source. There is no owner, admin, upgrade, pause or oracle; the fixed dev wallet alone may request and bind the token launch once. After binding, permissionless distribution runs at most once per seven days, starting immediately: IMD is split 40% to staking, 25.72% to jobs, 17.14% to dev and 17.14% to marketing, with rounding dust to marketing. Launched tokens go to the dead address and native ETH is pushed to marketing on a best-effort basis. StakeRewards streams IMD over seven days with carry; JobsVault requires one million whole tokens staked and locks the stake for 24 hours per paid job. SimdAirdrop uses the fixed 457-wallet Merkle commitment and total weight, snapshots the funded remainder on binding, permits self-claims for 30 days and then permits burning unclaimed tokens. The manifest deploys the application set only. Token launch payment and binding are subsequent application operations by the fixed dev wallet. Source verification on Sourcify for chain 4663 must cover SIMDVault and all three constructor-created children after their deployment addresses are confirmed."
+}
