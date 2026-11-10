@@ -1,0 +1,349 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.26;
+
+import {Test, Vm} from "forge-std/Test.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Network} from "../../src/Network.sol";
+import {SIMDVault} from "../../src/SIMDVault.sol";
+import {StakeRewards} from "../../src/StakeRewards.sol";
+import {JobsVault} from "../../src/JobsVault.sol";
+import {SimdAirdrop} from "../../src/SimdAirdrop.sol";
+import {IIntake} from "../../src/interfaces/IIntake.sol";
+import {PoolKey} from "../../src/interfaces/ILaunchFactory.sol";
+import {LaunchPool} from "../../src/libraries/LaunchPool.sol";
+import {MerkleFixture} from "../helpers/MerkleFixture.sol";
+import {ILiveFactory, ForkLaunchToken, ForkInitHook, ForkSwapActor} from "./LiveFactory.sol";
+
+/// @notice Run with forge test --match-contract RobinhoodForkTest --fork-url <rpc>.
+/// An archive RPC can additionally pin --fork-block-number; the public RPC prunes old state.
+/// No test reads environment variables or creates a network dependency for the offline suite.
+/// Factory, Intake, IMD and PoolManager code/storage are never replaced or mocked.
+contract RobinhoodForkTest is Test, Network, MerkleFixture {
+    uint64 internal constant FIXTURE_NUMBER = 9_994_663;
+    uint256 internal constant WEEK = 7 days;
+    SIMDVault internal vault;
+    StakeRewards internal rewards;
+    JobsVault internal jobs;
+    SimdAirdrop internal drop;
+    IERC20 internal token;
+    ILiveFactory internal factory = ILiveFactory(FACTORY);
+    address internal alice;
+    address internal bob;
+    address internal carol;
+
+    function setUp() public {
+        try vm.activeFork() returns (uint256) {}
+        catch {
+            vm.skip(true);
+        }
+        assertEq(block.chainid, 4663, "fork must be Robinhood Chain");
+        assertGt(IMD.code.length, 0);
+        assertGt(INTAKE.code.length, 0);
+        assertGt(FACTORY.code.length, 0);
+        alice = makeAddr("fork alice");
+        bob = makeAddr("fork bob");
+        carol = makeAddr("fork carol");
+        vault = new SIMDVault();
+        rewards = vault.stakeRewards();
+        jobs = vault.jobsVault();
+        drop = vault.airdrop();
+        _createRealFactoryLaunch();
+    }
+
+    function _createRealFactoryLaunch() internal {
+        ILiveFactory.LaunchParams memory p;
+        p.launchNumber = FIXTURE_NUMBER;
+        p.kind = bytes32("univ4_hook");
+        p.tokenCreationCode = type(ForkLaunchToken).creationCode;
+        p.hookCreationCode = type(ForkInitHook).creationCode;
+        p.hookFlags = 1 << 13; // beforeInitialize only
+        bytes32 codeHash = keccak256(p.hookCreationCode);
+        for (uint256 salt;; ++salt) {
+            address predicted =
+                address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), FACTORY, bytes32(salt), codeHash)))));
+            if (uint160(predicted) & ((1 << 14) - 1) == p.hookFlags) {
+                p.hookSalt = bytes32(salt);
+                break;
+            }
+        }
+        p.totalSupply = 1e30;
+        p.poolBps = 1000;
+        p.remainderTo = address(drop);
+        p.merkleRoot = keccak256("fork-only contributor fixture");
+        p.sweepDelaySeconds = 30 days;
+        p.pairedCurrency = IMD;
+        p.fee = 3000;
+        p.tickSpacing = 60;
+        p.sqrtPriceX96 = uint160(1 << 96);
+        p.liquidity = 1e24;
+        address predictedToken = factory.predictToken(FIXTURE_NUMBER, p.tokenCreationCode);
+        bool token0 = predictedToken < IMD;
+        p.tickLower = token0 ? int24(60) : int24(-120);
+        p.tickUpper = token0 ? int24(120) : int24(-60);
+        p.requester = address(vault);
+        p.record.sourceRepoUrl = "local fork fixture";
+        address deployer = factory.deployer();
+        vm.prank(deployer);
+        (address created,,) = factory.launch(p);
+        token = IERC20(created);
+        assertEq(created, predictedToken);
+        assertGe(token.balanceOf(address(drop)), drop.TOTAL_WEIGHT());
+    }
+
+    function _bind() internal {
+        vm.prank(DEV);
+        vault.bindLaunch(FIXTURE_NUMBER, address(token));
+    }
+
+    function _stake(address account, uint256 amount) internal {
+        deal(address(token), account, token.balanceOf(account) + amount);
+        vm.startPrank(account);
+        token.approve(address(rewards), amount);
+        rewards.stake(amount);
+        vm.stopPrank();
+    }
+
+    function _deposit(uint256 amount) internal {
+        deal(IMD, address(rewards), IERC20(IMD).balanceOf(address(rewards)) + amount);
+        vm.prank(address(vault));
+        rewards.notifyDeposit();
+    }
+
+    function _advance(uint256 elapsed) internal {
+        vm.warp(block.timestamp + elapsed);
+        vm.roll(block.number + elapsed / 12 + 1);
+    }
+
+    function _claim(address account) internal {
+        vm.prank(account);
+        rewards.claim();
+    }
+
+    function testFork_blocksAloneCannotAdvanceWeeklyCooldown() public {
+        _bind();
+        vault.distribute();
+        uint256 next = vault.nextDistributionAt();
+        vm.roll(block.number + 10_000_000);
+        vm.expectRevert(abi.encodeWithSelector(SIMDVault.TooSoon.selector, next));
+        vault.distribute();
+        vm.warp(next);
+        vault.distribute();
+    }
+
+    function testFork_realIntakeLaunchOnlyDevOnceAndApprovalReset() public {
+        uint256 price = IIntake(INTAKE).priceOf(bytes32("launch.open@launch-1"), IMD);
+        assertGt(price, 0);
+        deal(IMD, address(vault), price);
+        // Intake checks bytes/payment. Actual off-chain admission and deployment do not run on a fork.
+        bytes memory body = bytes(
+            '{"objective":"SIMD TEST 3 - DO NOT BUY fork payment fixture","onchain":"evm_contracts","chainId":4663}'
+        );
+        vm.expectRevert(SIMDVault.NotDev.selector);
+        vault.launch(body);
+        vm.prank(DEV);
+        bytes32 id = vault.launch(body);
+        assertTrue(id != bytes32(0));
+        assertEq(IERC20(IMD).balanceOf(address(vault)), 0);
+        assertEq(IERC20(IMD).allowance(address(vault), INTAKE), 0);
+        vm.prank(DEV);
+        vm.expectRevert(SIMDVault.AlreadyLaunched.selector);
+        vault.launch(body);
+    }
+
+    function testFork_bindOnlyDevOnceRejectsForeignRequesterAndBindsRemainderInSameCall() public {
+        vm.expectRevert(SIMDVault.NotDev.selector);
+        vault.bindLaunch(FIXTURE_NUMBER, address(token));
+        vm.prank(address(vault));
+        factory.setRequester(FIXTURE_NUMBER, alice);
+        vm.prank(DEV);
+        vm.expectRevert(LaunchPool.WrongRequester.selector);
+        vault.bindLaunch(FIXTURE_NUMBER, address(token));
+        vm.prank(alice);
+        factory.setRequester(FIXTURE_NUMBER, address(vault));
+        _bind();
+        assertEq(drop.token(), address(token));
+        assertEq(drop.startBalance(), token.balanceOf(address(drop)));
+        assertEq(rewards.token(), address(token));
+        assertEq(jobs.token(), address(token));
+        vm.prank(DEV);
+        vm.expectRevert(SIMDVault.AlreadyBound.selector);
+        vault.bindLaunch(FIXTURE_NUMBER, address(token));
+    }
+
+    function testFork_realSwapFeesSplitBurnAndWeeklyBoundary() public {
+        _bind();
+        (PoolKey memory key,,,) = factory.positionOf(FIXTURE_NUMBER);
+        ForkSwapActor actor = new ForkSwapActor(factory.poolManager());
+        deal(IMD, address(actor), 1e24);
+        bool zeroForOne = key.currency0 == IMD;
+        uint160 limit =
+            zeroForOne ? uint160((uint256(1) << 96) * 995 / 1000) : uint160((uint256(1) << 96) * 1005 / 1000);
+        actor.swap(key, zeroForOne, limit);
+        // Preview the real factory's fee payout on an isolated snapshot, then restore it.
+        uint256 snapshot = vm.snapshotState();
+        factory.claimFees(FIXTURE_NUMBER);
+        uint256 fees = IERC20(IMD).balanceOf(address(vault));
+        assertGt(fees, 0, "real swap must accrue requester fees");
+        assertTrue(vm.revertToState(snapshot));
+        deal(IMD, address(vault), 10000 ether);
+        deal(address(token), address(vault), 10 ether);
+        uint256 walletBefore = IERC20(IMD).balanceOf(DEV);
+        uint256 nativeBefore = MARKETING.balance;
+        vm.deal(address(vault), 1 ether);
+        vault.distribute();
+        uint256 total = 10000 ether + fees;
+        uint256 staking = total * 4000 / 10000;
+        uint256 jobShare = total * 2572 / 10000;
+        assertEq(IERC20(IMD).balanceOf(address(rewards)), staking);
+        assertEq(rewards.reserved(), staking);
+        assertEq(IERC20(IMD).balanceOf(address(jobs)), jobShare);
+        assertEq(IERC20(IMD).balanceOf(DEV) - walletBefore, total - staking - jobShare);
+        assertEq(IERC20(IMD).balanceOf(address(vault)), 0);
+        assertEq(token.balanceOf(DEAD), 10 ether);
+        assertEq(MARKETING.balance - nativeBefore, 1 ether);
+        _advance(WEEK - 1);
+        vm.expectRevert(abi.encodeWithSelector(SIMDVault.TooSoon.selector, vault.nextDistributionAt()));
+        vault.distribute();
+        _advance(1);
+        vault.distribute();
+    }
+
+    function testFork_soleStakerGetsWholeWeek() public {
+        _bind();
+        _stake(alice, 1 ether);
+        _deposit(604800 ether);
+        _advance(WEEK);
+        _claim(alice);
+        assertEq(IERC20(IMD).balanceOf(alice), 604800 ether);
+    }
+
+    function testFork_twoStakersSplitByStake() public {
+        _bind();
+        _stake(alice, 1 ether);
+        _stake(bob, 3 ether);
+        _deposit(604800 ether);
+        _advance(WEEK);
+        _claim(alice);
+        _claim(bob);
+        assertEq(IERC20(IMD).balanceOf(alice), 151200 ether);
+        assertEq(IERC20(IMD).balanceOf(bob), 453600 ether);
+    }
+
+    function testFork_oneHourStakerGetsOne168thOfShare() public {
+        _bind();
+        _stake(alice, 1 ether);
+        _advance(1 days);
+        _stake(bob, 1 ether);
+        _deposit(604800 ether);
+        _advance(1 hours);
+        vm.prank(bob);
+        rewards.exit();
+        assertEq(IERC20(IMD).balanceOf(bob), 1800 ether);
+    }
+
+    function testFork_noStakersCarryIntoNextDeposit() public {
+        _bind();
+        _deposit(604800 ether);
+        _advance(WEEK);
+        _stake(alice, 1 ether);
+        _deposit(604800 ether);
+        _advance(WEEK);
+        _claim(alice);
+        assertEq(IERC20(IMD).balanceOf(alice), 1209600 ether);
+    }
+
+    function testFork_midStreamDepositKeepsRemainder() public {
+        _bind();
+        _stake(alice, 1 ether);
+        _deposit(604800 ether);
+        _advance(WEEK / 2);
+        _deposit(604800 ether);
+        _advance(WEEK);
+        _claim(alice);
+        assertEq(IERC20(IMD).balanceOf(alice), 1209600 ether);
+    }
+
+    function testFork_jobsRealIntakeThresholdCooldownAndEarningWhileLocked() public {
+        _bind();
+        _stake(alice, 1_000_000 ether - 1);
+        deal(IMD, address(jobs), 5 ether);
+        bytes memory body = bytes('{"objective":"Explain the SIMD TEST 3 disclaimer","template":"research"}');
+        vm.prank(alice);
+        vm.expectRevert(JobsVault.InsufficientStake.selector);
+        jobs.requestJob(body);
+        _stake(alice, 1);
+        _deposit(604800 ether);
+        uint256 price = IIntake(INTAKE).priceOf(bytes32("job.open@job-1"), IMD);
+        vm.prank(alice);
+        jobs.requestJob(body);
+        uint256 until = rewards.lockedUntil(alice);
+        assertEq(until, block.timestamp + 1 days);
+        assertEq(IERC20(IMD).allowance(address(jobs), INTAKE), 0);
+        assertEq(IERC20(IMD).balanceOf(address(jobs)), 5 ether - price);
+        _advance(1 days - 1);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(JobsVault.TooSoon.selector, until));
+        jobs.requestJob(body);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(StakeRewards.StakeLocked.selector, until));
+        rewards.exit();
+        _advance(1);
+        _claim(alice);
+        assertEq(IERC20(IMD).balanceOf(alice), 86400 ether);
+        vm.prank(alice);
+        jobs.requestJob(body);
+        _advance(1 days);
+        vm.prank(alice);
+        rewards.exit();
+    }
+
+    function testFork_airdropFixtureProofsDeadlineAndBurn() public {
+        uint256 weight = drop.TOTAL_WEIGHT() / 2;
+        _installFixtureRoot(drop, _pair(_leaf(alice, weight), _leaf(bob, weight)));
+        _bind();
+        bytes32[] memory proof = _proof(_leaf(bob, weight));
+        uint256 amount = drop.amountOf(weight);
+        vm.prank(carol);
+        vm.expectRevert(SimdAirdrop.InvalidProof.selector);
+        drop.claim(weight, proof);
+        vm.prank(alice);
+        vm.expectRevert(SimdAirdrop.InvalidProof.selector);
+        drop.claim(weight + 1, proof);
+        vm.prank(alice);
+        drop.claim(weight, proof);
+        assertEq(token.balanceOf(alice), amount);
+        vm.prank(alice);
+        vm.expectRevert(SimdAirdrop.AlreadyClaimed.selector);
+        drop.claim(weight, proof);
+        vm.warp(drop.claimEnd() - 1);
+        vm.expectRevert(SimdAirdrop.ClaimStillOpen.selector);
+        drop.burnUnclaimed();
+        _advance(1);
+        vm.prank(bob);
+        vm.expectRevert(SimdAirdrop.ClaimClosed.selector);
+        drop.claim(weight, _proof(_leaf(alice, weight)));
+        uint256 remaining = token.balanceOf(address(drop));
+        drop.burnUnclaimed();
+        assertEq(token.balanceOf(DEAD), remaining);
+    }
+
+    /// forge-config: default.fuzz.runs = 256
+    function testFuzz_forkNeverOverpaysAndBalanceCoversReserved(uint128 a, uint128 b, uint32 elapsed) public {
+        _bind();
+        uint256 amountA = bound(uint256(a), 1, 1e28);
+        uint256 amountB = bound(uint256(b), 1, 1e28);
+        _stake(alice, amountA);
+        _stake(bob, amountB);
+        _deposit(amountA);
+        _advance(uint256(elapsed) % (2 * WEEK));
+        _claim(alice);
+        _deposit(amountB);
+        _advance(WEEK);
+        _claim(bob);
+        _claim(alice);
+        uint256 paid = IERC20(IMD).balanceOf(alice) + IERC20(IMD).balanceOf(bob);
+        assertLe(paid, amountA + amountB);
+        assertGe(IERC20(IMD).balanceOf(address(rewards)), rewards.reserved());
+        assertEq(paid + rewards.reserved(), amountA + amountB);
+    }
+}
