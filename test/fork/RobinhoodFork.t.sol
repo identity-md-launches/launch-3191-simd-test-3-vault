@@ -14,11 +14,20 @@ import {LaunchPool} from "../../src/libraries/LaunchPool.sol";
 import {MerkleFixture} from "../helpers/MerkleFixture.sol";
 import {ILiveFactory, ForkLaunchToken, ForkInitHook, ForkSwapActor} from "./LiveFactory.sol";
 
-/// @notice Run with forge test --match-contract RobinhoodForkTest --fork-url <rpc>.
-/// An archive RPC can additionally pin --fork-block-number; the public RPC prunes old state.
-/// No test reads environment variables or creates a network dependency for the offline suite.
+/// @notice Uses ROBINHOOD_RPC_URL at the assignment's fixed block, or skips when absent.
 /// Factory, Intake, IMD and PoolManager code/storage are never replaced or mocked.
 contract RobinhoodForkTest is Test, Network, MerkleFixture {
+    event Requested(
+        bytes32 indexed requestId,
+        address indexed payer,
+        bytes32 indexed action,
+        bytes body,
+        address callbackTarget,
+        bytes4 callbackSelector,
+        address asset,
+        uint256 amount
+    );
+
     uint64 internal constant FIXTURE_NUMBER = 9_994_663;
     uint256 internal constant WEEK = 7 days;
     SIMDVault internal vault;
@@ -32,10 +41,12 @@ contract RobinhoodForkTest is Test, Network, MerkleFixture {
     address internal carol;
 
     function setUp() public {
-        try vm.activeFork() returns (uint256) {}
-        catch {
+        string memory url = vm.envOr("ROBINHOOD_RPC_URL", string(""));
+        if (bytes(url).length == 0) {
             vm.skip(true);
+            return;
         }
+        vm.createSelectFork(url, 111189501);
         assertEq(block.chainid, 4663, "fork must be Robinhood Chain");
         assertGt(IMD.code.length, 0);
         assertGt(INTAKE.code.length, 0);
@@ -140,6 +151,10 @@ contract RobinhoodForkTest is Test, Network, MerkleFixture {
         );
         vm.expectRevert(SIMDVault.NotDev.selector);
         vault.launch(body);
+        vm.expectEmit(false, true, true, true, INTAKE);
+        emit Requested(
+            bytes32(0), address(vault), bytes32("launch.open@launch-1"), body, address(0), bytes4(0), IMD, price
+        );
         vm.prank(DEV);
         bytes32 id = vault.launch(body);
         assertTrue(id != bytes32(0));
@@ -148,6 +163,61 @@ contract RobinhoodForkTest is Test, Network, MerkleFixture {
         vm.prank(DEV);
         vm.expectRevert(SIMDVault.AlreadyLaunched.selector);
         vault.launch(body);
+    }
+
+    function testFork_realIntakeRejectedLaunchPreservesFundsAllowanceAndOneTimeFlag() public {
+        uint256 price = IIntake(INTAKE).priceOf(bytes32("launch.open@launch-1"), IMD);
+        assertGt(price, 0);
+        deal(IMD, address(vault), price - 1);
+        vm.prank(DEV);
+        vm.expectRevert(); // The real IMD refuses an underfunded transferFrom.
+        vault.launch("{}");
+        assertFalse(vault.launched());
+        assertEq(IERC20(IMD).balanceOf(address(vault)), price - 1);
+        assertEq(IERC20(IMD).allowance(address(vault), INTAKE), 0);
+
+        deal(IMD, address(vault), price);
+        vm.prank(DEV);
+        vm.expectRevert(); // The real Intake rejects an empty body.
+        vault.launch("");
+        assertFalse(vault.launched());
+        assertEq(IERC20(IMD).balanceOf(address(vault)), price);
+        assertEq(IERC20(IMD).allowance(address(vault), INTAKE), 0);
+        vm.prank(DEV);
+        vault.launch("{}");
+        assertTrue(vault.launched());
+        assertEq(IERC20(IMD).balanceOf(address(vault)), 0);
+    }
+
+    function testFork_bindingWrongTokenRollsBackAndUnfundedAirdropCanBeRetriedByAnyone() public {
+        vm.prank(DEV);
+        vm.expectRevert(SIMDVault.WrongToken.selector);
+        vault.bindLaunch(FIXTURE_NUMBER, IMD);
+        assertEq(vault.token(), address(0));
+        assertEq(rewards.token(), address(0));
+        assertEq(jobs.token(), address(0));
+
+        uint256 required = drop.TOTAL_WEIGHT();
+        deal(address(token), address(drop), required - 1);
+        _bind();
+        assertEq(vault.token(), address(token));
+        assertEq(rewards.token(), address(token));
+        assertEq(jobs.token(), address(token));
+        assertEq(drop.token(), address(0));
+        assertEq(drop.claimEnd(), 0);
+        vm.prank(bob);
+        vm.expectRevert(SimdAirdrop.InsufficientRemainder.selector);
+        vault.bindAirdrop();
+        _advance(2 days);
+        deal(address(token), address(drop), required);
+        vm.prank(bob);
+        vault.bindAirdrop();
+        assertEq(drop.token(), address(token));
+        assertEq(drop.startBalance(), required);
+        assertEq(drop.claimEnd(), block.timestamp + 30 days);
+        vm.prank(carol);
+        vm.expectRevert(SimdAirdrop.AlreadyBound.selector);
+        vault.bindAirdrop();
     }
 
     function testFork_bindOnlyDevOnceRejectsForeignRequesterAndBindsRemainderInSameCall() public {
@@ -295,6 +365,61 @@ contract RobinhoodForkTest is Test, Network, MerkleFixture {
         _advance(1 days);
         vm.prank(alice);
         rewards.exit();
+    }
+
+    function testFork_realIntakeFailedJobRestoresStakeLockCooldownBudgetAndAllowance() public {
+        _bind();
+        _stake(alice, 1_000_000 ether);
+        uint256 price = IIntake(INTAKE).priceOf(bytes32("job.open@job-1"), IMD);
+        assertGt(price, 0);
+        deal(IMD, address(jobs), price - 1);
+        bytes memory body = bytes('{"objective":"Explain the SIMD TEST 3 disclaimer","template":"research"}');
+        vm.prank(alice);
+        vm.expectRevert();
+        jobs.requestJob(body);
+        assertEq(rewards.lockedUntil(alice), 0);
+        assertEq(jobs.nextJobAt(alice), 0);
+        assertEq(rewards.stakeOf(alice), 1_000_000 ether);
+        assertEq(IERC20(IMD).balanceOf(address(jobs)), price - 1);
+        assertEq(IERC20(IMD).allowance(address(jobs), INTAKE), 0);
+
+        deal(IMD, address(jobs), price);
+        vm.prank(alice);
+        vm.expectRevert(JobsVault.InvalidBody.selector);
+        jobs.requestJob(new bytes(16_385));
+        assertEq(rewards.lockedUntil(alice), 0);
+        vm.expectEmit(false, true, true, true, INTAKE);
+        emit Requested(bytes32(0), address(jobs), bytes32("job.open@job-1"), body, address(0), bytes4(0), IMD, price);
+        vm.prank(alice);
+        jobs.requestJob(body);
+        assertEq(rewards.lockedUntil(alice), block.timestamp + 1 days);
+        assertEq(jobs.nextJobAt(alice), block.timestamp + 1 days);
+        assertEq(IERC20(IMD).balanceOf(address(jobs)), 0);
+        assertEq(IERC20(IMD).allowance(address(jobs), INTAKE), 0);
+    }
+
+    function testFork_originalAirdropCommitmentRejectsForgedClaimAndBurnsAtExpiry() public {
+        _bind();
+        assertEq(drop.MERKLE_ROOT(), 0xe1fc34a5aee64c3cd01e62934929bc57511b5718c2f5ae80072ae25045e50cb4);
+        uint256 balance = token.balanceOf(address(drop));
+        uint256 weight = drop.TOTAL_WEIGHT();
+        vm.prank(alice);
+        vm.expectRevert(SimdAirdrop.InvalidProof.selector);
+        drop.claim(weight, new bytes32[](0));
+        assertFalse(drop.claimed(alice));
+        assertEq(token.balanceOf(alice), 0);
+        assertEq(token.balanceOf(address(drop)), balance);
+        vm.warp(drop.claimEnd() - 1);
+        vm.expectRevert(SimdAirdrop.ClaimStillOpen.selector);
+        drop.burnUnclaimed();
+        _advance(1);
+        vm.prank(alice);
+        vm.expectRevert(SimdAirdrop.ClaimClosed.selector);
+        drop.claim(1, new bytes32[](0));
+        vm.prank(bob);
+        drop.burnUnclaimed();
+        assertEq(token.balanceOf(address(drop)), 0);
+        assertEq(token.balanceOf(DEAD), balance);
     }
 
     function testFork_airdropFixtureProofsDeadlineAndBurn() public {
